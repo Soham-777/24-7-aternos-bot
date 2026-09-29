@@ -1,107 +1,325 @@
+const { goals } = require('mineflayer-pathfinder')
+
 function randomMs(minMs, maxMs) {
     return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs
 }
 
 function setupLeaveRejoin(bot, createBot) {
     // Timers
-    let leaveTimer = null
     let jumpTimer = null
     let jumpOffTimer = null
-    let reconnectTimer = null
+    let sleepCheckTimer = null
+    let sleepRetryTimer = null
 
     // State
     let stopped = false
-    let reconnectAttempts = 0
+    let sleeping = false
+    let sleepAttemptInProgress = false
     let lastLogAt = 0
 
     function logThrottled(msg, minGapMs = 2000) {
         const now = Date.now()
+
         if (now - lastLogAt >= minGapMs) {
             lastLogAt = now
             console.log(msg)
         }
     }
 
-    function cleanup() {
-        stopped = true
-        if (leaveTimer) clearTimeout(leaveTimer)
+    function clearJumpTimers() {
         if (jumpTimer) clearTimeout(jumpTimer)
         if (jumpOffTimer) clearTimeout(jumpOffTimer)
-        if (reconnectTimer) clearTimeout(reconnectTimer)
-        leaveTimer = jumpTimer = jumpOffTimer = reconnectTimer = null
+
+        jumpTimer = null
+        jumpOffTimer = null
+
+        try {
+            bot.setControlState('jump', false)
+        } catch (e) {
+            // Ignore if bot is already disconnected
+        }
+    }
+
+    function clearSleepTimers() {
+        if (sleepCheckTimer) clearTimeout(sleepCheckTimer)
+        if (sleepRetryTimer) clearTimeout(sleepRetryTimer)
+
+        sleepCheckTimer = null
+        sleepRetryTimer = null
+    }
+
+    function cleanup() {
+        stopped = true
+
+        clearJumpTimers()
+        clearSleepTimers()
+
+        sleeping = false
+        sleepAttemptInProgress = false
+    }
+
+    // Minecraft time:
+    // 0     = sunrise
+    // 6000  = noon
+    // 12000 = sunset
+    // 18000 = midnight
+    // 24000 = next sunrise
+    function isNight() {
+        if (!bot || !bot.time) return false
+
+        const time = bot.time.timeOfDay
+
+        return time >= 12500 && time < 23500
+    }
+
+    function findNearestBed() {
+        if (!bot || !bot.entity || !bot.findBlock) {
+            return null
+        }
+
+        return bot.findBlock({
+            matching: block => {
+                return (
+                    block &&
+                    typeof block.name === 'string' &&
+                    block.name.endsWith('_bed')
+                )
+            },
+            maxDistance: 32
+        })
     }
 
     function scheduleNextJump() {
-        if (stopped || !bot.entity) return
+        if (stopped || sleeping || !bot.entity) return
 
-        bot.setControlState('jump', true)
-        jumpOffTimer = setTimeout(() => {
-            bot.setControlState('jump', false)
-        }, 300)
-
-        // random jump 20s -> 5m
-        const nextJump = randomMs(20000, 5 * 60 * 1000)
-        jumpTimer = setTimeout(scheduleNextJump, nextJump)
-    }
-
-    function scheduleReconnect(reason = 'end') {
-        if (stopped) return
-
-        // FAST RECONNECT: 2s -> 10s (User requested faster)
-        let delay = randomMs(2000, 10000)
-
-        // Slight backoff for repeated failures, but keep it snappy
-        reconnectAttempts++
-        if (reconnectAttempts > 3) {
-            delay += 5000 // Add 5s if it's failing a lot
+        // Don't keep jumping at night.
+        if (isNight()) {
+            return
         }
 
-        // Cap at 30s max
-        delay = Math.min(delay, 15000)
+        try {
+            bot.setControlState('jump', true)
 
-        logThrottled(`[AFK] Rejoin scheduled in ${Math.round(delay / 1000)}s (reason: ${reason}, attempt: ${reconnectAttempts})`)
+            jumpOffTimer = setTimeout(() => {
+                if (!stopped) {
+                    try {
+                        bot.setControlState('jump', false)
+                    } catch (e) {
+                        // Ignore disconnect errors
+                    }
+                }
 
-        reconnectTimer = setTimeout(() => {
-            if (stopped) return
+                jumpOffTimer = null
+            }, 300)
+
+            // Random jump every 20s -> 5m
+            const nextJump = randomMs(20000, 5 * 60 * 1000)
+
+            jumpTimer = setTimeout(() => {
+                jumpTimer = null
+                scheduleNextJump()
+            }, nextJump)
+        } catch (e) {
+            // Ignore control errors if disconnected
+        }
+    }
+
+    async function goToBedAndSleep() {
+        if (
+            stopped ||
+            sleeping ||
+            sleepAttemptInProgress ||
+            !bot ||
+            !bot.entity ||
+            !bot.pathfinder
+        ) {
+            return
+        }
+
+        if (!isNight()) {
+            scheduleSleepCheck(5000)
+            return
+        }
+
+        sleepAttemptInProgress = true
+
+        try {
+            const bed = findNearestBed()
+
+            if (!bed) {
+                logThrottled(
+                    '[Sleep] 🌙 Night detected, but no bed was found within 32 blocks.',
+                    10000
+                )
+
+                sleepAttemptInProgress = false
+                scheduleSleepCheck(10000)
+                return
+            }
+
+            logThrottled(
+                `[Sleep] 🛏️ Bed found at ${bed.position.x}, ${bed.position.y}, ${bed.position.z}. Walking to it...`,
+                3000
+            )
+
+            // Stop AFK jumping while going to the bed.
+            clearJumpTimers()
+
+            // Stop any previous pathfinder movement.
             try {
-                if (typeof createBot === 'function') createBot()
+                bot.pathfinder.setGoal(null)
             } catch (e) {
-                console.log('[AFK] createBot error:', e?.message || e)
-                scheduleReconnect('createBot-error')
+                // Ignore
+            }
+
+            // Walk close to the bed.
+            await bot.pathfinder.goto(
+                new goals.GoalNear(
+                    bed.position.x,
+                    bed.position.y,
+                    bed.position.z,
+                    1
+                )
+            )
+
+            if (stopped || !bot.entity) {
+                sleepAttemptInProgress = false
+                return
+            }
+
+            // It could have become daytime while walking.
+            if (!isNight()) {
+                sleepAttemptInProgress = false
+                scheduleSleepCheck(5000)
+                scheduleNextJump()
+                return
+            }
+
+            // Stop movement before attempting to sleep.
+            try {
+                bot.pathfinder.setGoal(null)
+                bot.clearControlStates()
+            } catch (e) {
+                // Ignore
+            }
+
+            logThrottled('[Sleep] 😴 Trying to sleep...')
+
+            await bot.sleep(bed)
+
+            // Mineflayer should emit "sleep" when this succeeds.
+            sleeping = true
+            sleepAttemptInProgress = false
+
+            logThrottled('[Sleep] 💤 Bot is now sleeping.', 3000)
+
+            // No more checks needed until wake.
+            clearSleepTimers()
+        } catch (err) {
+            sleeping = false
+            sleepAttemptInProgress = false
+
+            try {
+                bot.pathfinder.setGoal(null)
+                bot.clearControlStates()
+            } catch (e) {
+                // Ignore
+            }
+
+            logThrottled(
+                `[Sleep] Could not sleep: ${err?.message || err}`,
+                5000
+            )
+
+            // Retry shortly in case the bed was occupied,
+            // unreachable, or the timing was slightly off.
+            scheduleSleepCheck(5000)
+        }
+    }
+
+    function scheduleSleepCheck(delay = 5000) {
+        if (stopped) return
+
+        clearSleepTimers()
+
+        sleepCheckTimer = setTimeout(() => {
+            sleepCheckTimer = null
+
+            if (stopped || !bot.entity) return
+
+            if (sleeping || bot.isSleeping) {
+                return
+            }
+
+            if (isNight()) {
+                goToBedAndSleep()
+            } else {
+                // Daytime: make sure normal AFK jumping is running.
+                if (!jumpTimer && !sleeping) {
+                    scheduleNextJump()
+                }
+
+                scheduleSleepCheck(5000)
             }
         }, delay)
     }
 
     bot.once('spawn', () => {
-        // reset attempt counter on successful connect
-        reconnectAttempts = 0
-
-        // clear any old timers
+        // Reset state for this connection.
         cleanup()
         stopped = false
+        sleeping = false
+        sleepAttemptInProgress = false
 
-        // Stay connected: 2 minutes -> 15 minutes (More realistic AFK behavior)
-        // Stay connected 1-5 minutes before a scheduled leave/rejoin cycle.
-        const stayTime = randomMs(60000, 300000)
+        logThrottled(
+            '[AFK] ✅ Connected. Daytime AFK + automatic nighttime bed sleeping enabled.',
+            3000
+        )
 
-        logThrottled(`[AFK] Will leave in ${Math.round(stayTime / 1000)} seconds`)
+        // Start normal daytime AFK movement.
+        if (!isNight()) {
+            scheduleNextJump()
+        }
 
-        scheduleNextJump()
-
-        leaveTimer = setTimeout(() => {
-            if (stopped) return
-            logThrottled('[AFK] Leaving server (timer)')
-            cleanup()
-            try {
-                bot.quit()
-            } catch (e) {
-                // ignore if already closed
-            }
-        }, stayTime)
+        // Start Minecraft-time sleep checking.
+        scheduleSleepCheck(5000)
     })
 
-    // When the connection ends for ANY reason, just clean up our timers.
-    // Reconnection is handled by index.js — no duplicate reconnect here.
+    // Mineflayer emits this when the bot successfully enters a bed.
+    bot.on('sleep', () => {
+        sleeping = true
+        sleepAttemptInProgress = false
+
+        clearJumpTimers()
+        clearSleepTimers()
+
+        try {
+            bot.pathfinder.setGoal(null)
+            bot.clearControlStates()
+        } catch (e) {
+            // Ignore
+        }
+
+        logThrottled('[Sleep] 🛏️ Bot entered the bed and is sleeping.', 3000)
+    })
+
+    // Mineflayer emits this when morning wakes the bot.
+    bot.on('wake', () => {
+        sleeping = false
+        sleepAttemptInProgress = false
+
+        logThrottled('[Sleep] ☀️ Morning! Bot woke up and resumed AFK.', 3000)
+
+        if (!stopped && bot.entity) {
+            scheduleNextJump()
+            scheduleSleepCheck(5000)
+        }
+    })
+
+    // IMPORTANT:
+    // No scheduled bot.quit() anymore.
+    // Your index.js remains responsible for reconnecting if the connection ends.
+
     bot.on('end', () => {
         cleanup()
     })
