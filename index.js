@@ -1619,8 +1619,8 @@ function initializeModules(bot, mcData, defaultMove) {
   if (config.modules.combat) {
     combatModule(bot, mcData);
   }
-  if (config.modules.beds) {
-    bedModule(bot, mcData);
+ // Automatic in-game bed sleeping
+bedModule(bot, mcData);
   }
   if (config.modules.chat) {
     chatModule(bot);
@@ -1813,41 +1813,291 @@ function combatModule(bot, mcData) {
 // Bed module
 // FIX: bot.isSleeping can be stale; use a local isTryingToSleep guard to prevent double-sleep errors
 // FIX: place-night was false in default settings - documentation note added
+// Bed module
+// Automatically walks to a nearby bed and sleeps during Minecraft night.
 function bedModule(bot, mcData) {
   let isTryingToSleep = false;
+  let lastBedLogAt = 0;
 
-  addInterval(async () => {
-    if (!bot || !botState.connected) return;
-    if (!config.beds["place-night"]) return; // FIX: check flag (was always skipping before)
+  const NIGHT_START = 12541;
+  const NIGHT_END = 23458;
+  const BED_SEARCH_DISTANCE = 32;
+
+  function bedLog(message, minGap = 2000) {
+    const now = Date.now();
+
+    if (now - lastBedLogAt >= minGap) {
+      lastBedLogAt = now;
+      addLog(message);
+    }
+  }
+
+  function isNight() {
+    const time = bot?.time?.timeOfDay;
+
+    return (
+      typeof time === "number" &&
+      time >= NIGHT_START &&
+      time <= NIGHT_END
+    );
+  }
+
+  function getNearbyBeds() {
+    if (
+      !bot ||
+      !bot.entity ||
+      typeof bot.findBlocks !== "function"
+    ) {
+      return [];
+    }
+
+    let positions = [];
 
     try {
-      const isNight =
-        bot.time.timeOfDay >= 12500 && bot.time.timeOfDay <= 23500;
-
-      // FIX: use local guard instead of stale bot.isSleeping
-      if (isNight && !isTryingToSleep) {
-        const bedBlock = bot.findBlock({
-          matching: (block) => block.name.includes("bed"),
-          maxDistance: 8,
-        });
-
-        if (bedBlock) {
-          isTryingToSleep = true;
+      positions = bot.findBlocks({
+        matching: (block) => {
           try {
-            await bot.sleep(bedBlock);
-            addLog("[Bed] Sleeping...");
+            if (typeof bot.isABed === "function") {
+              return bot.isABed(block);
+            }
+
+            return Boolean(
+              block &&
+              typeof block.name === "string" &&
+              block.name.endsWith("_bed")
+            );
           } catch (e) {
-            // Can't sleep - maybe not night enough or monsters nearby
-          } finally {
-            isTryingToSleep = false;
+            return false;
           }
+        },
+
+        maxDistance: BED_SEARCH_DISTANCE,
+        count: 20,
+      });
+    } catch (e) {
+      bedLog(
+        `[Bed] ❌ Could not search for beds: ${e.message}`,
+        3000
+      );
+
+      return [];
+    }
+
+    return positions
+      .map((pos) => bot.blockAt(pos))
+      .filter((block) => block && block.position)
+      .sort((a, b) => {
+        const distanceA =
+          bot.entity.position.distanceTo(a.position);
+
+        const distanceB =
+          bot.entity.position.distanceTo(b.position);
+
+        return distanceA - distanceB;
+      });
+  }
+
+  function stopMovement() {
+    try {
+      bot.clearControlStates();
+    } catch (e) {}
+
+    try {
+      if (bot.pathfinder) {
+        bot.pathfinder.setGoal(null);
+      }
+    } catch (e) {}
+  }
+
+  async function trySleepAtBed(bed) {
+    if (
+      !bot ||
+      !bot.entity ||
+      !bot.pathfinder ||
+      !isNight()
+    ) {
+      return false;
+    }
+
+    try {
+      stopMovement();
+
+      const movements = new Movements(bot, mcData);
+
+      movements.allowFreeMotion = false;
+      movements.canDig = false;
+      movements.liquidCost = 1000;
+      movements.fallDamageCost = 1000;
+
+      bot.pathfinder.setMovements(movements);
+
+      bedLog(
+        `[Bed] 🛏️ Walking to bed at ${bed.position.x}, ${bed.position.y}, ${bed.position.z}`,
+        2000
+      );
+
+      // Get next to the bed.
+      await Promise.race([
+        bot.pathfinder.goto(
+          new goals.GoalGetToBlock(
+            bed.position.x,
+            bed.position.y,
+            bed.position.z
+          )
+        ),
+
+        new Promise((_, reject) => {
+          setTimeout(() => {
+            reject(
+              new Error("Timed out while walking to bed")
+            );
+          }, 15000);
+        }),
+      ]);
+
+      if (
+        !bot ||
+        !bot.entity ||
+        !isNight() ||
+        bot.isSleeping
+      ) {
+        return false;
+      }
+
+      const distance =
+        bot.entity.position.distanceTo(bed.position);
+
+      bedLog(
+        `[Bed] 📏 Distance from bed: ${distance.toFixed(2)}`,
+        1000
+      );
+
+      if (distance > 3.2) {
+        bedLog(
+          "[Bed] ❌ Bot is still too far from the bed.",
+          2000
+        );
+
+        return false;
+      }
+
+      stopMovement();
+
+      bedLog(
+        "[Bed] 😴 Attempting to sleep...",
+        1000
+      );
+
+      await bot.sleep(bed);
+
+      if (bot.isSleeping) {
+        bedLog(
+          "[Bed] ✅ SUCCESS — BOT IS SLEEPING!",
+          1000
+        );
+
+        return true;
+      }
+
+      return false;
+    } catch (e) {
+      bedLog(
+        `[Bed] ❌ Sleep attempt failed: ${e?.message || String(e)}`,
+        2000
+      );
+
+      return false;
+    } finally {
+      stopMovement();
+    }
+  }
+
+  // Check Minecraft time every 3 seconds.
+  addInterval(async () => {
+    if (
+      !bot ||
+      !botState.connected ||
+      !bot.entity
+    ) {
+      return;
+    }
+
+    if (
+      !isNight() ||
+      bot.isSleeping ||
+      isTryingToSleep
+    ) {
+      return;
+    }
+
+    isTryingToSleep = true;
+
+    try {
+      const time = bot.time?.timeOfDay;
+
+      bedLog(
+        `[Bed] 🌙 Night detected. Minecraft time: ${time}`,
+        5000
+      );
+
+      const beds = getNearbyBeds();
+
+      if (beds.length === 0) {
+        bedLog(
+          `[Bed] ❌ No bed found within ${BED_SEARCH_DISTANCE} blocks.`,
+          5000
+        );
+
+        return;
+      }
+
+      bedLog(
+        `[Bed] 🛏️ Found ${beds.length} nearby bed(s).`,
+        3000
+      );
+
+      for (const bed of beds) {
+        if (
+          !bot ||
+          !bot.entity ||
+          bot.isSleeping ||
+          !isNight()
+        ) {
+          break;
+        }
+
+        const success = await trySleepAtBed(bed);
+
+        if (success) {
+          break;
         }
       }
     } catch (e) {
+      addLog(
+        `[Bed] ❌ Module error: ${e?.message || String(e)}`
+      );
+    } finally {
       isTryingToSleep = false;
-      addLog("[Bed] Error:", e.message);
     }
-  }, 10000);
+  }, 3000);
+
+  // Actual Mineflayer sleep confirmation.
+  bot.on("sleep", () => {
+    bedLog(
+      "[Bed] 🛏️💤 SLEEP EVENT — BOT IS ACTUALLY IN BED!",
+      1000
+    );
+
+    stopMovement();
+  });
+
+  // Actual Mineflayer wake confirmation.
+  bot.on("wake", () => {
+    bedLog(
+      "[Bed] ☀️ WAKE EVENT — BOT WOKE UP!",
+      1000
+    );
+  });
 }
 
 // Chat module
